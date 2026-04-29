@@ -1,0 +1,25 @@
+name: remote_project_prep
+version: "2.0.0"
+description: "在远程实例上全自动执行项目准备（包括构建 Conda 环境、安装依赖、下载数据集和预训练权重）。自动处理环境变量、内网穿透代理、Conda 环境复用检测、依赖安装重试及无状态 SSH 的闭环执行。"
+entry_point: "prep_runner.py:run_remote_prep"
+parameters:
+  type: object
+  properties:
+    ssh_ip: {type: string, description: "远程实例 IP"}
+    ssh_port: {type: string, description: "远程实例 SSH 端口"}
+    ssh_password: {type: string, description: "远程实例 SSH 密码"}
+    repo_name: {type: string, description: "项目名称（如 UP2You）"}
+    python_version: {type: string, description: "Python 版本（如 3.8、3.10、3.11），默认 3.10", default: "3.10"}
+    dependency_cmds:
+      type: array
+      items: {type: string}
+      description: "依赖安装命令列表（含 PyTorch 底座），由 Agent 在 step_4 中智能组装"
+    data_cmds:
+      type: array
+      items: {type: string}
+      description: "数据下载/预处理命令列表"
+    weight_cmds:
+      type: array
+      items: {type: string}
+      description: "模型权重下载命令列表"
+  required: ["ssh_ip", "ssh_port", "ssh_password", "repo_name", "dependency_cmds"]

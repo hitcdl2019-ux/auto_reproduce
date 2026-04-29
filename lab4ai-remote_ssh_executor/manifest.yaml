@@ -1,0 +1,13 @@
+name: lab4ai-remote_ssh_executor
+version: "1.0.0"
+description: "通过纯 Python 原生执行远程 SSH 命令，无需依赖宿主机的 sshpass，自带连接探活重试机制。"
+entry_point: "executor.py:run_ssh_cmd"
+parameters:
+  type: object
+  properties:
+    host: {type: string, description: "远程主机 IP"}
+    port: {type: integer, description: "SSH 端口"}
+    username: {type: string, description: "SSH 用户名，通常为 root"}
+    password: {type: string, description: "SSH 密码"}
+    command: {type: string, description: "需要执行的 bash 命令（支持多行复合命令）"}
+  required:["host", "port", "username", "password", "command"]

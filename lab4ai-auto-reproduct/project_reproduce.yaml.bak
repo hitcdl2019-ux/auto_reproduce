@@ -1,0 +1,443 @@
+version: "claw-workflow/v2.1"
+name: Lab4AI_Auto_Reproduction_Pipeline
+description: "端到端自动化复现 GitHub 项目流水线 (含极速探活、环境隔离与自动关机):集成强制 root 身份、C++ 环境自愈与自动释放算力"
+
+parameters:
+  github_url:
+    type: string
+    description: "需要复现的 GitHub 仓库地址 (必填)"
+  paper_url:
+    type: string
+    description: "关联论文的 PDF 链接 (选填,用于提取原论文背景、基准指标、超参数和复现思路)"
+
+env:
+  - source: "/workspace/.openclaw/.env"
+
+agent:
+  name: "Auto-Repro-Director"
+  system_prompt: |
+    你是一个顶尖的 AI 算法复现工程师。请严格按照任务顺序执行。
+    1. 【身份准则】:所有 SSH 连接必须强制使用 'root' 用户,忽略任何 API 返回的其他用户名。
+    2. 【自愈准则】:在执行 Step 5 环境构建时,若遇到 'Could not find', 'No such file', 'CMake Error' 等依赖缺失报错,禁止向用户提问。
+    3. 【排障逻辑】:你必须自动分析错误日志,识别缺失的系统库(apt-get)、Python 包(pip)或 C++ 库(vcpkg/conda),自动安装补全并重试,直到编译通过或重试达 5 次。
+    4. 【无状态兼容】:非交互式 SSH 必须使用链式命令,并在执行任何 Python 代码前显式激活目标 Conda 环境。注意非交互式 SSH 的无状态特性,执行 Python 代码时必须使用链式命令激活 Conda 环境。
+  skills:
+    # --- 自研 skill ---
+    - lab4ai-project-analysis
+    - lab4ai-paper-analysis
+    - lab4ai-instance-manage
+    - lab4ai-project-prep
+    - lab4ai-repro-report
+    # --- 第三方 skill (vendor/) ---
+    - file-system
+    - ssh-essentials
+    - claw-shell
+
+# ==========================================
+# 全局异常处理:用户中断 / 任务失败时的实例清理
+# ==========================================
+on_abort: |
+  🚨【强制清理规则】当用户发送「停止」「中断」「取消」等指令,或流水线任何步骤异常终止时:
+
+  1. Agent 必须立即检查当前上下文中是否存在未释放的实例 serverId
+  2. 若存在 CPU 实例 serverId(来自 step_3)且尚未执行 step_5 → 立即调用 lab4ai-instance-manage 关闭
+  3. 若存在 GPU 实例 serverId(来自 step_6)且尚未执行 step_9 → 立即调用 lab4ai-instance-manage 关闭
+  4. 释放完成后,向用户确认:「已释放 X 台实例,流水线已终止」
+  5. 🚨 即使用户说「停止一切操作」,实例释放也必须执行,这是唯一的例外
+
+  Agent 在每次创建实例后,必须在回复中明确记录 serverId,确保中断时可追溯。
+
+tasks:
+  # ==========================================
+  # 阶段一:项目复现可行性分析
+  # ==========================================
+  - id: step_1_audit
+    name: "项目复现可行性分析"
+    instruction: |
+      1. 从入参 `{{parameters.github_url}}` 提取项目名(例如 `nanoGPT`),这是执行复现的基础。
+      2. 【代码审计】:调用 `lab4ai-project-analysis` 对该 GitHub 链接进行复现可行性评估,提取系统环境依赖与潜在报错风险。
+      3. 【论文精读 (条件触发)】:检查是否传入了参数 `{{parameters.paper_url}}`。
+         - 若无 `paper_url`:跳过此子步骤,仅依靠 README 的信息。
+         - 若有 `paper_url`:调用 lab4ai-paper-analysis skill,**必须使用 `--output-dir /workspace/.openclaw/workspace/{{repo_name}}`** 将论文解析产物输出到项目目录下。从论文中深度提取以下内容:
+           a) 项目背景与核心创新点。
+           b) 论文作者声明的"标准复现超参数"(如 Batch Size, Learning Rate, Epochs)。
+           c) 效果评估的"官方 Baseline 指标"(如原论文宣称的 Loss 值、Accuracy 或吞吐量)。
+      4. 【报告生成】:将"代码可行性分析"与"论文基准数据"(若有)**整合为一份综合复现指导报告**,保存至 `/workspace/.openclaw/workspace/{{repo_name}}/{{repo_name}}_Audit_Report.md`。
+         - 🚨 最终交付物只有这一份报告。lab4ai-paper-analysis 的中间产物(PDF 原文、提取的纯文本、skill 生成的 _report.md)作为临时参考文件保留在项目目录下,但不作为正式交付物。
+         - Agent 必须读取 lab4ai-paper-analysis 的输出结果,将论文背景、创新点、Baseline 指标、超参数等内容融合写入审计报告中。
+      5. 【上下文记忆】:提取最终的可行性得分(score)。更重要的是,将论文中提取的"超参数"和"Baseline 指标"牢牢记住,它们将作为 Step 7 构建微调命令,以及 Step 8 填充对比表格的绝对依据!
+      6. 【推理/训练入口识别】:在审计报告中明确标注项目的推荐运行入口:
+         - 检查 `scripts/` 目录是否有现成的运行脚本(如 `run_*.sh`)
+         - 检查是否支持 CLI 入口(如 `python -m <package>` 或 `<package>-cli`)
+         - 检查 `examples/` 或 `demo/` 目录的示例脚本
+         - 记录到审计报告的「推荐推理/训练入口」字段,供 Step 7 参考,避免盲目试错
+    expected_output: "提取出项目的 score(数字),以及(若提供了论文)提取出的原论文背景、创新点、核心 Baseline 效果指标和复现超参数。最终交付一份综合审计报告。"
+
+  # ==========================================
+  # 阶段二:复现可行性熔断判断
+  # ==========================================
+
+  - id: step_2_condition_check
+    name: "复现可行性熔断判断"
+    depends_on:[step_1_audit]
+    instruction: |
+      检查上一步提取的 `score`:
+      - `score < 60`:立刻终止整个工作流(执行 `workflow.abort`)。
+      - `score >= 60`:输出"验证通过",继续执行。
+
+  # ==========================================
+  # 阶段三:【廉价算力】拉起 CPU 实例做脏活
+  # ==========================================
+  - id: step_3_deploy_cpu
+    name: "拉起廉价 CPU 实例"
+    depends_on:[step_2_condition_check]
+    instruction: |
+      调用 `lab4ai-instance-manage (创建)` 申请 1台 CPU 实例(2核)(在指令中明确要求 "CPU 2核",登录凭证见"/workspace/.openclaw/.env")。
+      获取 CPU 机器的 serverId、ssh_host (IP)、ssh_port 和 ssh_pass(强制用户名为 root)。
+    expected_output: "成功获取 CPU 实例的 SSH 信息。🚨 必须在回复中明确记录 serverId,供异常中断时释放实例使用。"
+
+  # ==========================================
+  # 阶段四:在 CPU 上拉取代码并智能调用全套准备技能
+  # ==========================================
+  - id: step_4_cpu_env_setup
+    name: "在 CPU 上拉取代码与智能环境/数据构建"
+    depends_on:[step_3_deploy_cpu]
+    instruction: |
+      本步骤分为两个阶段:【Agent 决策】和【Skill 执行】。Agent 只负责 SSH 探活、拉取代码、智能分析并组装命令;`lab4ai-project-prep` skill 负责远程执行(含 Conda 环境创建、依赖安装、数据/权重下载)。
+
+      🚨【最高作战纪律】:刚拉起的 CPU 实例需要 1~3 分钟启动 sshd 服务。探活最多重试 30 次(5 分钟),超时则判定实例异常。
+
+      **阶段 A:SSH 探活 + 拉取代码(Agent 直接执行)**
+
+      请调用 `claw-shell` 技能执行以下探活 + 克隆命令:
+      `RETRY=0; while ! sshpass -p '{{step_3.ssh_pass}}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {{step_3.ssh_port}} root@{{step_3.ssh_host}} "echo '🎉 SSH 服务已就绪!'"; do RETRY=$((RETRY+1)); if [ $RETRY -ge 30 ]; then echo '❌ SSH 探活超时(5分钟),实例可能异常'; exit 1; fi; echo "⏳ 等待 SSHD 启动... ($RETRY/30)"; sleep 10; done; sshpass -p '{{step_3.ssh_pass}}' ssh -o StrictHostKeyChecking=no -p {{step_3.ssh_port}} root@{{step_3.ssh_host}} "export http_proxy=http://10.201.85.65:1080 && export https_proxy=http://10.201.85.65:1080 && mkdir -p /workspace/user-data/codelab/{{repo_name}}/{code,dataset,model} && cd /workspace/user-data/codelab/{{repo_name}}/code && git clone --recursive {{parameters.github_url}} . "`
+
+      **阶段 B:智能分析与命令组装(Agent 的大脑工作)**
+
+      调用 `file-system` 读取 step_1 生成的审计报告和项目 `README.md`,从中提取以下信息并组装命令数组:
+
+      1. **识别 Python 版本约束**:
+         从审计报告、`pyproject.toml`、`setup.cfg` 或 `README.md` 中提取项目要求的 Python 版本(如 `python>=3.8,<3.11`)。若无明确约束,默认 `3.10`。
+
+      3. **识别项目构建类型与大象库**:
+         检查项目是否包含 `vcpkg.json`、`CMakeLists.txt` 等 C++ 构建文件:
+         - 若含 `vcpkg.json`:记录其远程绝对路径(如 `/workspace/user-data/codelab/{{repo_name}}/code/vcpkg.json`),传给 skill 的 `vcpkg_json_path` 参数
+         - skill 会自动检测 VTK/OpenCV/Boost 等大象库并用 apt 预编译包替代,同时剥离 CUDA 特性
+         - 若无 vcpkg.json:纯 Python 项目,无需传入,跳过此子步骤
+
+      2. **组装 `dependency_cmds` 数组**:
+         - 【第一条】必须是 PyTorch 底座安装命令(统一使用 CUDA 12.1,Lab4AI H100 实战验证兼容性最佳):
+           `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
+         - 【后续】从 requirements.txt / setup.py / README 中提取纯 Python 包安装命令
+         - 🚨【剔除危险编译】:**绝对禁止**包含 `pip install -e .`、`python setup.py`、`cmake`、`make`、`ninja` 等触发 C++/CUDA 编译的命令!这些留给 step_7 的 GPU 实例。
+
+      4. **组装 `data_cmds` 数组**(🚨 所有数据下载必须在 CPU 阶段完成,绝对禁止留到 GPU 阶段):
+         - 下载目标路径必须指向 `/workspace/user-data/codelab/{{repo_name}}/dataset/`
+         - 代码目录下已自动创建软链接 `code/data -> ../dataset` 和 `code/dataset -> ../dataset`,项目代码无需修改
+         - 常见数据源下载方式(必须在 dependency_cmds 中先安装对应工具):
+           • Google Drive → `pip install gdown && gdown "<file_id>" -O <output>`
+           • 百度网盘 → 提供链接和提取码,用户手动下载
+           • HuggingFace datasets → `python -c "from datasets import load_dataset; ..."`
+           • wget/curl 直链 → 直接放入 data_cmds
+         - 如下载后需要解压,解压命令也必须包含在 data_cmds 中
+         - 如果审计报告中标记了数据集下载链接,必须组装到 data_cmds 中,不得跳过
+
+         - 🚨【受限数据集识别与用户提示】:
+           若审计报告或 README 中发现以下特征,判定为受限数据集:
+           • 需要填写申请表 / 签署 license agreement
+           • 需要机构邮箱 / 学术身份验证
+           • 下载链接非公开(需邮件获取)
+           • 关键词: "request access"、"apply"、"agreement"、"contact authors"
+
+           对于受限数据集,Agent 必须:
+           a) 在看板中标注「⚠️ 受限数据集: <数据集名称>」
+           b) 向用户提示: 该数据集需要人工申请权限,并提供申请链接/联系方式
+           c) 询问用户: 是否跳过该数据集,使用项目自带示例数据进行 Smoke Test
+           d) 等待用户确认后再继续执行
+           e) 若用户选择跳过,在最终报告中注明「定量评估未执行(数据集需申请)」
+
+      5. **组装 `weight_cmds` 数组**(🚨 所有权重下载必须在 CPU 阶段完成,绝对禁止留到 GPU 阶段):
+         - 🚨【铁律】模型必须下载到 `/workspace/user-data/codelab/{{repo_name}}/model/` 目录下
+         - 🚨【HuggingFace 下载铁律】:
+           • **禁止使用 wget/curl 下载 HuggingFace 文件**(重定向不稳定,易下载到 HTML 错误页或文件损坏)
+           • **统一使用 Python API**: `hf_hub_download` 或 `snapshot_download`(自带重定向处理、断点续传、完整性校验)
+           • **默认首选 hf-mirror.com 镜像**,命令模板:
+             ```
+             export HF_ENDPOINT=https://hf-mirror.com && python -c "
+             from huggingface_hub import snapshot_download
+             snapshot_download(repo_id='<repo_id>', local_dir='<target_dir>')
+             "
+             ```
+           • 降级链: hf-mirror.com(默认首选)→ HuggingFace 原始地址 → ModelScope
+         - 🚨【路径适配三步法】(每个项目必须执行):
+           **Step A: 识别项目代码中模型的实际引用路径**
+             - 检查 README、run.sh、inference.py 中的 --model_path、--checkpoint 等参数
+             - 常见路径: pretrained_models/、checkpoints/、weights/、models/、human_models/
+           **Step B: 组装下载命令,目标路径统一指向 model/ 子目录**
+             - 例如项目引用 `pretrained_models/shape_predictor.pt`
+             - 则下载到 `/workspace/user-data/codelab/{{repo_name}}/model/pretrained_models/shape_predictor.pt`
+             - HuggingFace snapshot_download 示例:
+               ```
+               export HF_ENDPOINT=https://hf-mirror.com && python -c "
+               from huggingface_hub import snapshot_download
+               snapshot_download(repo_id='Co2y/UP2You', local_dir='/workspace/user-data/codelab/UP2You/model/')
+               "
+               ```
+               下载后 model/ 目录内会自动生成 pretrained_models/ 和 human_models/ 子目录
+           **Step C: 在 weight_cmds 末尾追加软链接命令**
+             - 将 code/ 下的引用路径指向 model/ 中的实际文件:
+               ```
+               ln -sf /workspace/user-data/codelab/{{repo_name}}/model/pretrained_models /workspace/user-data/codelab/{{repo_name}}/code/pretrained_models
+               ln -sf /workspace/user-data/codelab/{{repo_name}}/model/human_models /workspace/user-data/codelab/{{repo_name}}/code/human_models
+               ```
+             - 根据项目实际路径动态生成,有几个引用路径就创建几个软链接
+         - **下载后必须校验**: 检查目标目录下无零字节文件,文件数量和总大小符合预期
+
+      **阶段 C:调用 `lab4ai-project-prep` 技能执行**
+
+      将以下参数传给 skill,由它在远程实例上一站式完成 Conda 环境创建 + 依赖安装 + 数据/权重下载:
+      - `ssh_ip`: {{step_3.ssh_host}}
+      - `ssh_port`: {{step_3.ssh_port}}
+      - `ssh_password`: {{step_3.ssh_pass}}
+      - `repo_name`: {{repo_name}}
+      - `python_version`: 上面分析出的 Python 版本(如 "3.10")
+      - `dependency_cmds`: 上面组装的依赖命令数组
+      - `data_cmds`: 上面组装的数据命令数组
+      - `weight_cmds`: 上面组装的权重命令数组
+      - `vcpkg_json_path`: 若项目含 vcpkg.json,传入远程绝对路径(如 `/workspace/user-data/codelab/{{repo_name}}/code/vcpkg.json`),否则不传
+
+      🚨 Agent 不要自己创建 Conda 环境或安装依赖,这些全部由 skill 负责!
+
+      🚨【强制阻塞纪律】:在 `lab4ai-project-prep` skill 返回「✅ 远程项目准备全部成功」之前,绝对禁止执行 Step 5 及后续任何步骤!你必须等待 skill 的完整返回结果。如果 skill 返回失败或超时,必须先执行 Step 5 释放 CPU 实例,然后终止流水线。切记:CPU 环境准备通常需要 5-30 分钟,耐心等待是正确的行为!
+
+      **阶段 D：路径隔离预处理（防止推理/训练产物逃逸到项目根）**
+
+      在 `lab4ai-project-prep` 成功返回后、释放 CPU 之前,通过 SSH 执行路径隔离预处理:
+
+      1. **扫描 code/ 下所有配置中的 `../` 向上引用路径**:
+         ```bash
+         cd /workspace/user-data/codelab/{{repo_name}}/code
+         grep -rn '\.\./' --include='*.yaml' --include='*.yml' --include='*.json' --include='*.cfg' --include='*.ini' \
+           | grep -vE '(#|//|/\*|^Binary)' \
+           | grep -E '\.\./(checkpoints|weights|pretrained|output|results|logs|experiments|runs|save)' \
+           | head -30
+         ```
+      2. **对读取类路径（权重/数据引用）**:
+         - 在 `code/` 内创建软链接指向 `../model/` 或 `../dataset/` 下的对应子目录
+         - 用 `sed` 修改配置中的路径,去掉 `../` 前缀,使其指向 `code/` 内的软链接
+         - 例: `../checkpoints/` → 创建 `code/checkpoints -> ../model/checkpoints`,配置改为 `checkpoints/`
+         - 例: `../dataset/` → prep skill 已创建 `code/dataset -> ../dataset`,无需重复
+      3. **对写入类路径（输出/日志/实验结果）**:
+         - 用 `sed` 修改配置路径,去掉 `../` 前缀,使输出留在 `code/` 内部
+         - 例: `../output/train_output/` → 改为 `output/train_output/`
+         - 例: `../results/` → 改为 `results/`
+      4. **🚨 铁律：禁止在项目根目录 `/workspace/user-data/codelab/{{repo_name}}/` 创建任何文件、目录或软链接。所有修正必须在 `code/` 内部完成。**
+      5. **记录所有路径修正**,以便 Step 7 推理时可验证。
+
+    expected_output: "lab4ai-project-prep skill 返回了'✅ 远程项目准备全部成功',代码已克隆,Conda 环境已创建,PyTorch 底座及纯 Python 依赖在 CPU 准备完毕,编译命令已剥离。路径隔离预处理已完成,所有 `../` 逃逸路径已修正。"
+
+  # ==========================================
+  # 阶段五:释放 CPU 实例
+  # ==========================================
+  - id: step_5_release_cpu
+    name: "释放 CPU 实例"
+    depends_on:[step_4_cpu_env_setup]
+    instruction: |
+      🚨【前置校验 - 两项必须全部通过】:
+
+      1. 确认 `lab4ai-project-prep` skill 已返回「✅ 远程项目准备全部成功」。若 Step 4 尚未完成或未返回成功标记,绝对禁止执行本步骤--立即停下来等待 Step 4 完成!
+
+      2. 🚨【权重文件二次校验】通过 SSH 远程执行以下命令,确认模型文件真实存在且非零:
+         ```
+         find /workspace/user-data/codelab/{{repo_name}}/model/ -type f \( -name '*.pt' -o -name '*.pth' -o -name '*.safetensors' -o -name '*.pkl' -o -name '*.bin' -o -name '*.npz' \) -exec ls -lh {} \;
+         ```
+         - 若无任何输出(目录为空)且 Step 4 的 weight_cmds 非空 → 禁止释放,回退排查下载失败原因
+         - 若存在零字节文件 → 禁止释放,重试下载
+         - 两项校验全部通过后,方可执行关机
+
+      🚨 强制关机指令:
+      你现在需要关闭刚才完成环境搭建的 CPU 实例。
+      1. 请回溯 `step_3_deploy_cpu` 步骤的输出结果。
+      2. 提取出对应的 `serverId`。
+      3. 立即调用 `lab4ai-instance-manage (关闭)` 技能,传入该 ID 作为 `serverId`。
+      (大模型内部核对逻辑:该 ID 必须是你刚才用于 SSH 连接 `{{step_3.ssh_host}}` 的同一台机器的 ID!)
+    expected_output: "CPU 实例释放成功。"
+
+  # ==========================================
+  # 阶段六:拉起 GPU 实例
+  # ==========================================
+  - id: step_6_deploy_gpu
+    name: "拉起 H800A GPU 实例"
+    depends_on: [step_5_release_cpu]
+    instruction: |
+      🚨【前置校验】:确认 Step 5 已成功释放 CPU 实例(返回了 serverId 关机确认)。若 Step 5 未完成,绝对禁止创建 GPU 实例。
+
+      1. 调用 `lab4ai-instance-manage (创建)` 技能申请 GPU 资源,明确指定 "1张GPU"(targetModel 只接受 CPU 或 GPU,不接受 H800A 等具体型号)。
+      2. 🚨 必须从工具的返回结果中,精准提取该 GPU 实例的 `serverId`、`ssh_host` (IP)、`ssh_port` 和 `ssh_pass`(默认用户名为 root)。
+      3. 将这些信息牢记在上下文中,供下一步 SSH 连接和最终的关机技能使用。
+    expected_output: "成功获取 GPU 实例的 SSH 连接信息。🚨 必须在回复中明确记录 serverId,供异常中断时释放实例使用。"
+
+
+
+  # ==========================================
+  # 阶段七:GPU 环境编译、微调测试与效果比对
+  # ==========================================
+  - id: step_7_gpu_execution
+    name: "SSH 探活、底层算子编译与微调测试"
+    depends_on:[step_6_deploy_gpu]
+    instruction: |
+      🚨【最高作战纪律】:刚拉起的 GPU 实例需要 1~3 分钟启动 sshd 服务。你必须使用以下"自带轮询探活"的复合命令来进行连接!
+      请调用 `claw-shell` 技能执行 SSH 任务,并在连接成功后,**将以下任务合并为一段完整的 Bash 脚本一次性执行**。
+
+      **任务 0:CUDA 特性恢复 + 系统开发库预装(若 CPU 阶段剥离过 CUDA 特性)**
+      在 SSH 探活成功后,先执行以下恢复操作:
+      1. 检查 `/workspace/user-data/codelab/{{repo_name}}/code/cuda_features.json` 是否存在
+      2. 若存在:读取其内容,将剥离的 cuda 特性恢复到 `vcpkg.json` 中
+      3. 预装系统基础开发库(与 CPU 阶段相同):
+         `apt-get update -qq && apt-get install -y -qq libopengl-dev libegl1-mesa-dev libglu1-mesa-dev libxt-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libxcomposite-dev libxdamage-dev libxfixes-dev zip autoconf autoconf-archive`
+      4. 重新执行 `vcpkg install` 补编 CUDA 相关包(设置 `VCPKG_MAX_CONCURRENCY=8`)
+      5. 安装 GPU 专用库(如 cuDSS),重新 cmake configure 打开 CUDA 相关选项
+      若不存在 cuda_features.json,跳过此步骤。
+
+      **任务 0.5:Import 预检(编译前快速排雷)**
+      在任何编译或推理之前,先执行 import 级检测,提前暴露 CPU 阶段遗留的版本兼容问题:
+      ```bash
+      python -c "import torch; print(f'torch={torch.__version__}, CUDA={torch.cuda.is_available()}')"
+      # 尝试 import 项目主包(如果 CPU 阶段已 pip install 过)
+      python -c "import {{repo_name_underscore}}" 2>/dev/null || echo '主包未安装,将在编译阶段安装'
+      ```
+      若发现 import 报错(如 `torch.int1` 不存在、`NoneType` 等),先排查并修复版本兼容问题,再继续后续任务。
+      常见修复策略:
+      - `torchao` 版本不兼容 → 降级到与当前 PyTorch 匹配的版本(如 PyTorch 2.5.x 用 torchao≤0.7.0)
+      - `flashinfer` 缺失 → `pip install flashinfer-python`
+      - `flash-attn` 编译失败 → 尝试 `sageattention` 作为替代
+
+      **任务 1:CUDA 扩展与底层 C++ 算子的终极编译自愈**
+      审查该项目的 requirements 或安装说明。**只要发现需要编译底层 C++/CUDA 算子的依赖包**(特征:如 `nvdiffrast`, `flash-attn`, `apex`, `pytorch3d`, `kaolin`, `spconv`,或者以 `git+https://...` 形式拉取的底层库):
+      你**绝对禁止盲目直接运行 pip install**!必须强行在 SSH 命令前缀中注入以下系统级编译修正变量(专为 H800A/H100 sm_90 架构设计):
+
+      ```bash
+      # 1. SSH 探活 (保持此逻辑在最外层)
+      RETRY=0; while ! sshpass -p '{{step_6.ssh_pass}}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {{step_6.ssh_port}} root@{{step_6.ssh_host}} "echo '🎉 SSH 服务已就绪!'"; do RETRY=$((RETRY+1)); if [ $RETRY -ge 30 ]; then echo '❌ SSH 探活超时(5分钟),实例可能异常'; exit 1; fi; echo "⏳ 等待 SSHD 启动... ($RETRY/30)"; sleep 10; done;
+
+      # 2. 正式连接并注入全局环境变量
+      sshpass -p '{{step_6.ssh_pass}}' ssh -o StrictHostKeyChecking=no -p {{step_6.ssh_port}} root@{{step_6.ssh_host}} "
+      source /opt/conda/bin/activate /workspace/envs/{{repo_name}}
+      cd /workspace/user-data/codelab/{{repo_name}}/code
+      export http_proxy=http://10.201.85.65:1080 && export https_proxy=http://10.201.85.65:1080
+
+      # 💥【黄金编译法则注入】强制重定向 CUDA 头文件路径到系统完整版
+      export CUDA_HOME=/usr/local/cuda
+      export PATH=\$CUDA_HOME/bin:\$PATH
+      export CPATH=\$CUDA_HOME/include:\$CPATH
+      export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
+
+      # 💥 导出 Hopper 架构专属算子指令并开启 8 核多线程加速
+      export TORCH_CUDA_ARCH_LIST=\"9.0\"
+      export MAX_JOBS=8
+
+      # 💥 补齐基础编译工具
+      pip install setuptools wheel ninja
+
+      # 💥 动态执行 C++ 库源码编译(你必须动态将扫描到的包填入这里,并且必须带上 --no-build-isolation 击穿隔离机制)
+      # 例如:pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation[由你根据项目实际的 CUDA 扩展包动态生成编译命令,必须带 --no-build-isolation]
+      如果你在复现依赖中发现pytorch3d:
+      pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
+
+      ```
+       - 如果该项目是大语言模型(LLM)或基于 Transformer 的架构,请强制在此处执行 `pip install flash-attn --no-build-isolation`!它能让 H800A 的 Hopper 架构(sm_90)性能翻倍!
+      *(若编译遇到 `gcc` 报错,自主分析并使用 `apt-get install build-essential` 补齐依赖并重试。)*
+
+      **任务 1.5：推理/训练前路径隔离校验**
+      在构造推理/训练命令之前,必须验证 Step 4 阶段 D 的路径隔离预处理已生效,并补充遗漏:
+      1. 扫描即将使用的配置文件中所有 `../` 开头的路径引用:
+         ```bash
+         cd /workspace/user-data/codelab/{{repo_name}}/code
+         grep -rn '\.\./' --include='*.yaml' --include='*.yml' --include='*.json' \
+           | grep -vE '(#|//|url|http|git)' | head -20
+         ```
+      2. 若发现任何会写出 `code/` 目录的残留路径（Step 4 可能未完全覆盖）:
+         - 读取类（权重/数据引用）→ 在 `code/` 内创建软链接 + sed 修正配置
+         - 写入类（输出/日志/结果）→ sed 去掉 `../` 前缀,使输出留在 `code/` 内
+      3. 🚨 铁律：**禁止在项目根目录 `/workspace/user-data/codelab/{{repo_name}}/` 创建任何文件、目录或软链接**。所有修正必须在 `code/` 内部完成。
+      4. 校验完成后记录修正清单,继续执行任务 2。
+
+      **任务 2:推理/训练入口探测与 Smoke Test 命令构造(动态策略)**
+      🚨 **推理入口探测优先级**(从最接近作者实际用法的入口开始):
+      1. 1 **Shell 脚本**:检查 `scripts/` 目录下的 `.sh` 文件,修改路径和参数后直接运行
+      2. 2 **CLI 入口**:检查是否支持 `python -m <package>.infer` 或 `python -m <package>.train` 等命令行方式
+      3. 3 **示例脚本**:检查 `examples/` 或 `demo/` 目录下的 `.py` 文件
+      4. 4 **Python API**:参考 README 中的 Python 代码示例,编写内联脚本
+      i️ 若某个入口报错,不要反复重试同一种方式,应降级到下一优先级的入口。
+
+      - 查阅本地的 Audit 报告和项目 README,提取核心超参数(如学习率、优化器、论文总 epochs)。
+      - 🚨 **根据项目类型动态选择 Smoke Test 强度**:
+        • **推理类项目**(无需训练,纯 inference):直接跑完整推理,不缩减参数
+        • **轻量训练类项目**(单 GPU,论文训练 <4h):跑论文 epochs 的 **10%**(最少 10 epochs,最多 50 epochs)
+        • **重度训练类项目**(多 GPU / 论文训练 >24h):限制 max_steps=500 或 epochs=1
+      - 确保命令包含 `--device=cuda` 或等效参数激活显卡。
+      - 在 SSH 中执行该训练命令,追加 `2>&1 | tee -a repro_run.log` 实时捕获终端日志。
+
+      **任务 3:多维效果比对与日志抓取 (核心交付物)**
+      - 任务完成后,你必须从终端日志中"抠出"以下关键指标:
+        1 **训练/评估指标**:初始 Loss、最终 Loss、Accuracy(若有)。
+        2 **资源消耗**:GPU 显存占用量 (VRAM)、每步耗时 (Time per step/iter)。
+      - 将你跑出来的真实指标,与 step_1 中提取的"原论文 Baseline 结果"进行对比,牢记这些数据,准备喂给 `lab4ai-repro-report`!
+
+      **任务 4：环境补丁记录**
+      - 将本次复现过程中对构建系统的所有修改（如 CMakeLists.txt 调整、vcpkg.json 修改、系统库补装、CUDA 特性恢复等）整理成 `env_patches.md`，保存到 `/workspace/user-data/codelab/{{repo_name}}/code/env_patches.md`
+      - 记录每处修改的原因和通用性判断，供后续类似项目参考
+      
+      **任务 5：项目根目录规范性校验（硬断言）**
+      - 🚨 这是推理/训练完成后的强制校验。若发现非规范项,说明 Step 4 阶段 D 或 Step 7 任务 1.5 的路径隔离未完全覆盖,需记录为 BUG。
+      - 🚨 硬性规定：项目根目录 `/workspace/user-data/codelab/{{repo_name}}/` 下只允许存在 `code/`、`dataset/`、`model/` 三个文件夹和一个 `README.md`
+      - 通过 SSH 执行校验 + 清理:
+        ```bash
+        cd /workspace/user-data/codelab/{{repo_name}}
+        VIOLATIONS=0
+        for item in $(ls -A); do
+          case "$item" in
+            code|dataset|model|README.md) ;;
+            *) echo "❌ 违规项: $item"; VIOLATIONS=$((VIOLATIONS+1)); rm -rf "$item" ;;
+          esac
+        done
+        if [ $VIOLATIONS -gt 0 ]; then
+          echo "⚠️ 发现 $VIOLATIONS 个违规项已清理。请排查 Step 4 阶段 D / Step 7 任务 1.5 的路径隔离是否有遗漏，记录到 env_patches.md 供后续项目参考。"
+        else
+          echo "✅ 项目根目录完全合规"
+        fi
+        ```
+    expected_output: "C++ 编译通过(所有 CUDA 扩展正确安装),模型成功在 GPU 上跑通并抓取了 Loss 和资源消耗指标。"
+  # ==========================================
+  # 阶段八:生成与导出详尽版 Word 报告 (Skill 驱动版)
+  # ==========================================
+  - id: step_8_generate_report
+    name: "结构化抽取与生成 Word 报告"
+    depends_on:[step_7_gpu_execution]
+    instruction: |
+      🚨 所有的复现步骤已经完成!现在请调用 `lab4ai-repro-report` 技能。
+      你无需自己编写 Python 脚本,只需将你脑海中记录的所有复现细节(超参数、踩坑记录、Loss对比等),按照该技能规定的 JSON 参数格式,完整、详尽地传递给它即可!
+      请务必确保 `results_comparison` 数组中包含了量化的对比数据。
+
+      🚨 同时必须传入 `readme_params` 参数生成项目 README.md：
+      - `project_title`: 项目完整标题（如 "MoFlow — 运动引导光流循环渲染帧预测"）
+      - `project_summary`: 项目简介（1-3 段话，描述论文背景和核心创新）
+      - `project_highlights`: 项目要点（Markdown 格式，2-4 个要点块，每个要点用 `- 📚 **标题**` + 子项 `* 内容` 格式）
+      - `repro_quickstart`: 可选的快速复现命令说明
+    expected_output: "成功调用排版技能,返回 Word 文件、Markdown 文件和 README.md 的保存路径。"
+
+
+  # ==========================================
+  # 阶段九:释放 GPU 实例
+  # ==========================================
+  - id: step_9_release_gpu
+    name: "释放 GPU 实例"
+    depends_on:[step_8_generate_report]
+    instruction: |
+      🚨 强制关机指令:
+      你现在需要关闭刚才完成环境搭建的 GPU 实例。
+      1. 请回溯 `step_6_deploy_gpu` 步骤的输出结果。
+      2. 提取出对应的 `serverId`。
+      3. 立即调用 `lab4ai-instance-manage (关闭)` 技能,传入该 ID 作为 `serverId`。
+      (大模型内部核对逻辑:该 ID 必须是你刚才用于 SSH 连接 `{{step_6.ssh_host}}` 的同一台机器的 ID!)
+    expected_output: "GPU 实例释放成功。"

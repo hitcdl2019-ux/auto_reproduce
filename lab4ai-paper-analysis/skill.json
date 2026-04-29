@@ -1,0 +1,15 @@
+{
+  "name": "paper-analysis",
+  "version": "1.0.0",
+  "description": "全自动论文解析工具。接收 GitHub URL 或 PDF URL / 本地路径，自动下载论文 PDF，利用 PyMuPDF 提取全文，通过结构化搜索提取核心信息：研究背景、创新点、实验设置、量化指标、超参数、BASELINE 对比数据，并生成结构化报告保存至工作区。",
+  "trigger": [
+    "分析论文",
+    "解析 paper",
+    "提取论文指标",
+    "论文 baseline",
+    "读论文",
+    "paper analysis",
+    "parse paper"
+  ],
+  "author": "openclaw"
+}

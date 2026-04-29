@@ -1,0 +1,43 @@
+name: generate_repro_report
+version: "1.0.0"
+description: "将复现过程中收集到的项目档案、排坑记录、超参数和对比结果，自动排版并生成工业级 Word (.docx) 学术报告。"
+entry_point: "report_generator.py:generate_report"
+parameters:
+  type: object
+  properties:
+    repo_name:
+      type: string
+      description: "项目名称（如 nanoGPT）"
+    project_profile:
+      type: string
+      description: "项目档案与背景介绍（包含论文链接，不少于200字）"
+    implementation_steps:
+      type: object
+      description: "复现实施步骤的 5 个核心维度"
+      properties:
+        code_fetch: {type: string, description: "2.1 代码获取：Git URL 及 Clone 目录"}
+        env_setup: {type: string, description: "2.2 环境搭建：Conda环境、核心依赖包清单、遇到的报错及你的解决办法(排坑记录)"}
+        data_params: {type: string, description: "2.3 数据与参数：数据集路径及预处理执行过程"}
+        core_loop: {type: string, description: "2.4 核心流程：超参数(学习率/Batch/Epoch等)、启动命令、随机种子、断点续训路径"}
+        eval_process: {type: string, description: "2.5 评估流程：模型 Eval 调用方式"}
+      required: ["code_fetch", "env_setup", "data_params", "core_loop", "eval_process"]
+    results_comparison:
+      type: array
+      description: "结果对比数据，将自动渲染为 Word 表格"
+      items:
+        type: object
+        properties:
+          metric_name: {type: string, description: "评估维度（如 Loss, 准确率, 显存占用, 每步耗时）"}
+          official_value: {type: string, description: "原论文/官方预期值"}
+          reproduced_value: {type: string, description: "本次复现的实际结果"}
+    optimization_suggestions:
+      type: string
+      description: "后期全量训练/优化建议（如针对 H800A 的参数调整建议）"
+    font_chinese:
+      type: string
+      description: "报告的全局中文字体（如 微软雅黑, 黑体, 楷体。默认：微软雅黑）"
+    font_english:
+      type: string
+      description: "报告的全局英文字体（如 Times New Roman, Consolas。默认：Times New Roman）"
+  # 注意：不把字体放入 required 列表，作为可选参数，避免大模型每次都被迫去想一个字体
+  required:["repo_name", "project_profile", "implementation_steps", "results_comparison", "optimization_suggestions"]
